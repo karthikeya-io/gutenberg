@@ -9,7 +9,13 @@ import {
 	__experimentalVStack as VStack,
 } from '@wordpress/components';
 import { __ } from '@wordpress/i18n';
-import { LinkControl, useBlockEditingMode } from '@wordpress/block-editor';
+import {
+	BlockIcon,
+	LinkControl,
+	useBlockEditingMode,
+	store as blockEditorStore,
+} from '@wordpress/block-editor';
+import { useSelect, useDispatch } from '@wordpress/data';
 import {
 	useMemo,
 	useState,
@@ -18,6 +24,7 @@ import {
 	forwardRef,
 } from '@wordpress/element';
 import { useResourcePermissions } from '@wordpress/core-data';
+import { createBlock, store as blocksStore } from '@wordpress/blocks';
 import { plus } from '@wordpress/icons';
 import { useInstanceId } from '@wordpress/compose';
 import { isURL } from '@wordpress/url';
@@ -70,6 +77,112 @@ export function getSuggestionsQuery( type, kind ) {
 	}
 }
 
+function matchesSearch( values, searchValue ) {
+	const normalizedSearch = searchValue.trim().toLowerCase();
+
+	if ( ! normalizedSearch ) {
+		return false;
+	}
+
+	return values
+		.filter( Boolean )
+		.join( ' ' )
+		.toLowerCase()
+		.includes( normalizedSearch );
+}
+
+function getMatchingNavigationItems( {
+	allowedBlocks,
+	getBlockVariations,
+	searchValue,
+} ) {
+	if ( ! searchValue.trim() ) {
+		return [];
+	}
+
+	const blockItems = ( allowedBlocks || [] )
+		.filter( Boolean )
+		.filter( ( blockType ) => blockType.name !== 'core/navigation-link' )
+		.filter( ( blockType ) => blockType.supports?.inserter !== false )
+		.filter( ( blockType ) =>
+			matchesSearch(
+				[
+					blockType.title,
+					blockType.name,
+					...( blockType.keywords || [] ),
+				],
+				searchValue
+			)
+		)
+		.map( ( blockType ) => ( {
+			kind: 'block',
+			key: blockType.name,
+			title: blockType.title || blockType.name,
+			icon: blockType.icon,
+			blockName: blockType.name,
+		} ) );
+
+	const variationItems = (
+		getBlockVariations( 'core/navigation-link' ) || []
+	)
+		.filter( ( variation ) =>
+			matchesSearch(
+				[
+					variation.title,
+					variation.name,
+					variation.description,
+					...( variation.keywords || [] ),
+				],
+				searchValue
+			)
+		)
+		.map( ( variation ) => ( {
+			kind: 'variation',
+			key: `variation-${ variation.name }`,
+			title: variation.title || variation.name,
+			icon: variation.icon,
+			variation,
+		} ) );
+
+	return [ ...variationItems, ...blockItems ].slice( 0, 6 );
+}
+
+function createNavigationItemFromSearchResult( item ) {
+	if ( item.kind === 'variation' ) {
+		const { variation } = item;
+
+		return createBlock(
+			'core/navigation-link',
+			variation.attributes || {},
+			variation.innerBlocks || []
+		);
+	}
+
+	if ( item.blockName === 'core/navigation-submenu' ) {
+		return createBlock(
+			'core/navigation-submenu',
+			{
+				label: __( 'Submenu' ),
+			},
+			[ createBlock( 'core/navigation-link' ) ]
+		);
+	}
+
+	return createBlock( item.blockName );
+}
+
+function LinkUIItemIcon( { icon } ) {
+	if ( ! icon ) {
+		return null;
+	}
+
+	return (
+		<span className="link-ui-tools__block-icon">
+			<BlockIcon icon={ icon } showColors={ false } />
+		</span>
+	);
+}
+
 function UnforwardedLinkUI( props, ref ) {
 	const { label, url, opensInNewTab, type, kind, id } = props.link;
 
@@ -89,6 +202,7 @@ function UnforwardedLinkUI( props, ref ) {
 	const [ addingBlock, setAddingBlock ] = useState( false );
 	const [ addingPage, setAddingPage ] = useState( false );
 	const [ shouldFocusPane, setShouldFocusPane ] = useState( null );
+	const [ searchValue, setSearchValue ] = useState( '' );
 	// Stable initial value for LinkControl's uncontrolled inputValue prop.
 	// We track the search with the searchInputValueRef, then update the
 	// initialSearchValue state with the observed searchInputValueRef
@@ -102,6 +216,7 @@ function UnforwardedLinkUI( props, ref ) {
 	const updateSearchValue = ( value ) => {
 		searchInputValueRef.current = value;
 		setInitialSearchValue( value );
+		setSearchValue( value );
 	};
 	const linkControlWrapperRef = useRef();
 	const addPageButtonRef = useRef();
@@ -132,6 +247,42 @@ function UnforwardedLinkUI( props, ref ) {
 		} ),
 		[ label, opensInNewTab, url, kind, type, id, image, badges ]
 	);
+
+	const { replaceBlock } = useDispatch( blockEditorStore );
+
+	const { rootBlockClientId, matchingNavigationItems } = useSelect(
+		( select ) => {
+			const { getBlockRootClientId, getAllowedBlocks } =
+				select( blockEditorStore );
+			const { getBlockVariations } = select( blocksStore );
+
+			const parentClientId = clientId
+				? getBlockRootClientId( clientId )
+				: null;
+
+			return {
+				rootBlockClientId: parentClientId,
+				matchingNavigationItems: getMatchingNavigationItems( {
+					allowedBlocks: parentClientId
+						? getAllowedBlocks( parentClientId )
+						: [],
+					getBlockVariations,
+					searchValue,
+				} ),
+			};
+		},
+		[ clientId, searchValue ]
+	);
+
+	const handleInlineItemInsert = ( item ) => {
+		if ( ! clientId || ! rootBlockClientId ) {
+			return;
+		}
+
+		// In Link UI search, matched navigation items replace the current
+		// navigation-link placeholder instead of inserting a sibling.
+		replaceBlock( clientId, createNavigationItemFromSearchResult( item ) );
+	};
 
 	const handlePageCreated = ( pageLink ) => {
 		// Set the new page as the current link
@@ -214,6 +365,7 @@ function UnforwardedLinkUI( props, ref ) {
 							// Observe the input value so we can pass the value to the page creator
 							// and restore it on back button click
 							searchInputValueRef.current = value;
+							setSearchValue( value );
 						} }
 						inputValue={ initialSearchValue }
 						onRemove={ props.onRemove }
@@ -242,6 +394,13 @@ function UnforwardedLinkUI( props, ref ) {
 									}
 									canAddBlock={
 										blockEditingMode === 'default'
+									}
+									searchValue={ searchValue }
+									matchingNavigationItems={
+										matchingNavigationItems
+									}
+									onInsertNavigationItem={
+										handleInlineItemInsert
 									}
 								/>
 							);
@@ -292,16 +451,46 @@ const LinkUITools = ( {
 	setAddingPage,
 	canAddPage,
 	canAddBlock,
+	searchValue,
+	matchingNavigationItems,
+	onInsertNavigationItem,
 } ) => {
 	const blockInserterAriaRole = 'listbox';
+	const hasMatchingNavigationItems =
+		canAddBlock &&
+		!! searchValue?.trim() &&
+		matchingNavigationItems?.length > 0;
 
-	// Don't render anything if neither button should be shown
-	if ( ! canAddPage && ! canAddBlock ) {
+	if ( ! canAddPage && ! canAddBlock && ! hasMatchingNavigationItems ) {
 		return null;
 	}
 
 	return (
 		<VStack spacing={ 0 } className="link-ui-tools">
+			{ hasMatchingNavigationItems && (
+				<>
+					<div className="link-ui-tools__section-label">
+						{ __( 'Navigation items' ) }
+					</div>
+
+					{ matchingNavigationItems.map( ( item ) => (
+						<Button
+							key={ item.key }
+							__next40pxDefaultSize
+							onClick={ ( e ) => {
+								e.preventDefault();
+								onInsertNavigationItem( item );
+							} }
+						>
+							<LinkUIItemIcon icon={ item.icon } />
+							<span className="link-ui-tools__block-label">
+								{ item.title }
+							</span>
+						</Button>
+					) ) }
+				</>
+			) }
+
 			{ canAddPage && (
 				<Button
 					__next40pxDefaultSize
